@@ -25,7 +25,7 @@ def get_products(env):
     headers = {'Authorization': f'Bearer {strapi_token}'}
     response = requests.get(f'{strapi_url}/products', headers=headers)
     response.raise_for_status()
-    return response.json()  # Возвращаем список товаров
+    return response.json()['data']
 
 
 def start(update, context):
