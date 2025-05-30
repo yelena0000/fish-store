@@ -65,10 +65,7 @@ def handle_product_selection(update, context):
     if query.data == 'back_to_list':
         return back_to_list(update, context)
 
-    product_id = int(query.data)
-    products = context.user_data.get('products', [])
-    product = next((p for p in products if p['id'] == product_id), None)
-
+    product = get_selected_product(query.data, context)
     if not product:
         context.bot.send_message(
             chat_id=query.message.chat_id,
@@ -76,14 +73,29 @@ def handle_product_selection(update, context):
         )
         return HANDLE_MENU
 
-    message = (
+    show_product_details(query, context, product)
+    return HANDLE_MENU
+
+
+def get_selected_product(product_id_str, context):
+    try:
+        product_id = int(product_id_str)
+    except ValueError:
+        return None
+
+    products = context.user_data.get('products', [])
+    return next((p for p in products if p['id'] == product_id), None)
+
+
+def show_product_details(query, context, product):
+    message_text = (
         f"🐟 <b>{product['title']}</b>\n\n"
         f"{product['description']}\n\n"
         f"💵 Цена: {product['price']} руб./кг"
     )
-
-    keyboard = [[InlineKeyboardButton('⬅️ Вернуться к списку', callback_data='back_to_list')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton('⬅️ Вернуться к списку', callback_data='back_to_list')]
+    ])
 
     context.bot.delete_message(
         chat_id=query.message.chat_id,
@@ -91,31 +103,33 @@ def handle_product_selection(update, context):
     )
 
     if product.get('image'):
-        base_url = context.bot_data['env'].str('STRAPI_URL').rstrip('/')
-        image_path = product['image']['url'].lstrip('/')
-        image_url = f"{base_url}/{image_path}"
-
-        response = requests.get(image_url, stream=True)
-        response.raise_for_status()
-
-        with BytesIO(response.content) as photo_data:
-            photo_data.seek(0)
-            context.bot.send_photo(
-                chat_id=query.message.chat_id,
-                photo=photo_data,
-                caption=message,
-                parse_mode='HTML',
-                reply_markup=reply_markup
-            )
+        send_product_photo(query, context, product, message_text, reply_markup)
     else:
         context.bot.send_message(
             chat_id=query.message.chat_id,
-            text=message,
+            text=message_text,
             parse_mode='HTML',
             reply_markup=reply_markup
         )
 
-    return HANDLE_MENU
+
+def send_product_photo(query, context, product, caption, reply_markup):
+    base_url = context.bot_data['env'].str('STRAPI_URL').rstrip('/')
+    image_path = product['image']['url'].lstrip('/')
+    image_url = f"{base_url}/{image_path}"
+
+    response = requests.get(image_url, stream=True)
+    response.raise_for_status()
+
+    with BytesIO(response.content) as photo_data:
+        photo_data.seek(0)
+        context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=photo_data,
+            caption=caption,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
 
 
 def back_to_list(update, context):
