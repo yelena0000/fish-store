@@ -1,5 +1,6 @@
 import os
 import logging
+from io import BytesIO
 
 import redis
 import requests
@@ -30,14 +31,15 @@ def get_products(env):
     strapi_url = env.str('STRAPI_URL')
     strapi_token = env.str('STRAPI_TOKEN')
     headers = {'Authorization': f'Bearer {strapi_token}'}
-    response = requests.get(f'{strapi_url}/products', headers=headers)
+    params = {'populate': '*'}
+    response = requests.get(f'{strapi_url}/api/products', headers=headers, params=params)
     response.raise_for_status()
     return response.json()['data']
 
 
 def start(update, context):
     products = get_products(context.bot_data['env'])
-    context.user_data['products'] = products  # Сохраняем все товары
+    context.user_data['products'] = products
 
     if not products:
         update.message.reply_text('ℹ️ Сейчас нет доступных товаров')
@@ -63,17 +65,15 @@ def handle_product_selection(update, context):
     if query.data == 'back_to_list':
         return back_to_list(update, context)
 
-    try:
-        product_id = int(query.data)
-    except ValueError:
-        query.edit_message_text('❌ Некорректный выбор')
-        return HANDLE_MENU
-
+    product_id = int(query.data)
     products = context.user_data.get('products', [])
     product = next((p for p in products if p['id'] == product_id), None)
 
     if not product:
-        query.edit_message_text('❌ Товар не найден')
+        context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text='❌ Товар не найден'
+        )
         return HANDLE_MENU
 
     message = (
@@ -83,12 +83,37 @@ def handle_product_selection(update, context):
     )
 
     keyboard = [[InlineKeyboardButton('⬅️ Вернуться к списку', callback_data='back_to_list')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    query.edit_message_text(
-        text=message,
-        parse_mode='HTML',
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    context.bot.delete_message(
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id
     )
+
+    if product.get('image'):
+        base_url = context.bot_data['env'].str('STRAPI_URL').rstrip('/')
+        image_path = product['image']['url'].lstrip('/')
+        image_url = f"{base_url}/{image_path}"
+
+        response = requests.get(image_url, stream=True)
+        response.raise_for_status()
+
+        with BytesIO(response.content) as photo_data:
+            photo_data.seek(0)
+            context.bot.send_photo(
+                chat_id=query.message.chat_id,
+                photo=photo_data,
+                caption=message,
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+    else:
+        context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=message,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
 
     return HANDLE_MENU
 
@@ -99,7 +124,10 @@ def back_to_list(update, context):
 
     products = context.user_data.get('products', [])
     if not products:
-        query.edit_message_text('ℹ️ Сейчас нет доступных товаров')
+        context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text='ℹ️ Сейчас нет доступных товаров'
+        )
         return ConversationHandler.END
 
     keyboard = [
@@ -107,12 +135,28 @@ def back_to_list(update, context):
         for product in products
     ]
 
-    query.edit_message_text(
-        '🎣 Выберите рыбу:',
+    context.bot.delete_message(
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id
+    )
+
+    context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text='🎣 Выберите рыбу:',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
     return HANDLE_MENU
+
+
+def error_handler(update, context):
+    logger.error("Ошибка во время обработки обновления:", exc_info=context.error)
+
+    if update and update.effective_chat:
+        context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text='⚠️ Произошла ошибка. Пожалуйста, попробуйте позже.'
+        )
 
 
 def main():
@@ -134,12 +178,12 @@ def main():
         dispatcher.bot_data['env'] = env
         dispatcher.bot_data['redis'] = redis_conn
 
+        dispatcher.add_error_handler(error_handler)
+
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler('start', start)],
             states={
-                HANDLE_MENU: [
-                    CallbackQueryHandler(handle_product_selection),
-                ],
+                HANDLE_MENU: [CallbackQueryHandler(handle_product_selection)],
             },
             fallbacks=[],
         )
@@ -155,7 +199,7 @@ def main():
     except requests.exceptions.RequestException as e:
         logger.critical(f'Ошибка при работе с API: {e}')
     except Exception as e:
-        logger.critical(f'Фатальная ошибка: {e}', exc_info=True)
+        logger.critical('Фатальная ошибка:', exc_info=True)
 
 
 if __name__ == '__main__':
