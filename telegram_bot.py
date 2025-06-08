@@ -5,23 +5,26 @@ import time
 from io import BytesIO
 from typing import Optional, Dict, List, Any, Union
 from datetime import datetime
+import re
 
 import redis
 import requests
 from environs import Env
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Filters,
+    filters,
     Updater,
     CommandHandler,
     CallbackQueryHandler,
     ConversationHandler,
     MessageHandler,
+    Filters,
 )
 
 logger = logging.getLogger(__name__)
 
-START, HANDLE_MENU, HANDLE_CART, HANDLE_QUANTITY = range(4)
+# Define all states at the beginning of the file
+START, HANDLE_MENU, HANDLE_PRODUCTS, HANDLE_CART, HANDLE_QUANTITY, WAITING_EMAIL = range(6)
 
 
 def get_database_connection(env):
@@ -97,7 +100,10 @@ def show_products_list(update, context):
     query = update.callback_query
     query.answer()
 
-    products = context.user_data.get('products', [])
+    strapi = context.bot_data['strapi']
+    products = strapi.get_products()
+    context.user_data['products'] = products
+
     if not products:
         safe_edit_message(
             query, context,
@@ -549,25 +555,153 @@ def handle_cart_actions(update, context):
     return HANDLE_CART
 
 
-def handle_checkout(update, context):
-    """Обработка оформления заказа"""
+def checkout(update, context):
+    """Handle checkout process"""
     query = update.callback_query
-
-    checkout_text = (
-        "📞 <b>Оформление заказа</b>\n\n"
-        "Для завершения заказа свяжитесь с нами:\n"
-        "📱 Телефон: +7 (XXX) XXX-XX-XX\n"
-        "💬 Telegram: @your_shop_bot\n\n"
-        "Мы свяжемся с вами для подтверждения заказа и согласования доставки!"
+    query.answer()
+    
+    user_id = str(update.effective_user.id)
+    strapi = context.bot_data['strapi']
+    
+    # Get user's cart
+    cart = strapi.get_cart(user_id)
+    logger.info(f"Cart data for user {user_id}: {cart}")
+    
+    # Проверяем структуру корзины
+    if not cart:
+        logger.warning(f"Cart is None for user {user_id}")
+        query.edit_message_text(
+            "Ваша корзина пуста. Добавьте товары перед оформлением заказа.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Вернуться в меню", callback_data="main_menu")
+            ]])
+        )
+        return HANDLE_MENU
+    
+    # Получаем товары корзины так же, как в view_cart
+    cart_items = cart.get('cart_products', [])
+    logger.info(f"Cart items: {cart_items}")
+    
+    if not cart_items:
+        logger.warning(f"No products in cart for user {user_id}")
+        query.edit_message_text(
+            "Ваша корзина пуста. Добавьте товары перед оформлением заказа.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Вернуться в меню", callback_data="main_menu")
+            ]])
+        )
+        return HANDLE_MENU
+    
+    # Request email from user
+    query.edit_message_text(
+        "Для оформления заказа, пожалуйста, введите ваш email:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Отмена", callback_data="main_menu")
+        ]])
     )
+    return WAITING_EMAIL
 
-    keyboard = [
-        [InlineKeyboardButton('🛒 Вернуться в корзину', callback_data='view_cart')],
-        [InlineKeyboardButton('🏠 В главное меню', callback_data='main_menu')]
-    ]
 
-    safe_edit_message(query, context, checkout_text, keyboard, parse_mode='HTML')
-    return HANDLE_CART
+def create_order(update, context):
+    """Create order after email is collected"""
+    user_id = str(update.effective_user.id)
+    strapi = context.bot_data['strapi']
+    
+    # Get user's cart
+    cart = strapi.get_cart(user_id)
+    logger.info(f"Cart data in create_order for user {user_id}: {cart}")
+    
+    if not cart:
+        logger.warning(f"Cart is None in create_order for user {user_id}")
+        update.message.reply_text(
+            "Ваша корзина пуста. Добавьте товары перед оформлением заказа.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Вернуться в меню", callback_data="main_menu")
+            ]])
+        )
+        return HANDLE_MENU
+    
+    # Получаем товары корзины так же, как в view_cart
+    cart_items = cart.get('cart_products', [])
+    logger.info(f"Cart items in create_order: {cart_items}")
+    
+    if not cart_items:
+        logger.warning(f"No products in cart in create_order for user {user_id}")
+        update.message.reply_text(
+            "Ваша корзина пуста. Добавьте товары перед оформлением заказа.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Вернуться в меню", callback_data="main_menu")
+            ]])
+        )
+        return HANDLE_MENU
+    
+    # Create order
+    try:
+        # Получаем email из сообщения пользователя
+        email = update.message.text.strip()
+        
+        # Создаем заказ с email
+        order = strapi.create_order(user_id, email)
+        logger.info(f"Order creation result: {order}")
+        
+        if order:
+            # Clear cart after successful order creation
+            strapi.clear_cart(user_id)
+            
+            update.message.reply_text(
+                "Спасибо за заказ! Мы свяжемся с вами в ближайшее время для уточнения деталей.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Вернуться в меню", callback_data="main_menu")
+                ]])
+            )
+        else:
+            update.message.reply_text(
+                "Произошла ошибка при создании заказа. Пожалуйста, попробуйте позже.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Вернуться в меню", callback_data="main_menu")
+                ]])
+            )
+    except Exception as e:
+        logger.error(f"Error creating order: {e}")
+        update.message.reply_text(
+            "Произошла ошибка при создании заказа. Пожалуйста, попробуйте позже.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Вернуться в меню", callback_data="main_menu")
+            ]])
+        )
+    
+    return HANDLE_MENU
+
+
+def handle_email(update, context):
+    """Handle email input and create order"""
+    try:
+        email = update.message.text.strip()
+        
+        # Basic email validation
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            update.message.reply_text(
+                "⚠️ Пожалуйста, введите корректный email адрес.\n"
+                "Например: user@example.com",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton('🏠 Отмена', callback_data='main_menu')
+                ]])
+            )
+            return WAITING_EMAIL
+
+        # Proceed to order creation
+        return create_order(update, context)
+
+    except Exception as e:
+        logger.error(f"Unexpected error in handle_email: {e}")
+        update.message.reply_text(
+            "⚠️ Произошла ошибка при сохранении данных.\n"
+            "Пожалуйста, попробуйте позже или обратитесь в поддержку.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton('🏠 В главное меню', callback_data='main_menu')
+            ]])
+        )
+        return HANDLE_MENU
 
 
 def remove_from_cart(update, context, item_id):
@@ -789,33 +923,70 @@ class StrapiError(Exception):
 class StrapiClient:
     """Client for interacting with Strapi API"""
 
-    def __init__(self, api_url: str, api_token: str):
+    def __init__(self, api_url, token):
+        # Ensure API URL ends with /api
         self.api_url = api_url.rstrip('/')
-        self.api_token = api_token
+        if not self.api_url.endswith('/api'):
+            self.api_url = f"{self.api_url}/api"
+            
+        self.token = token
         self.session = requests.Session()
         self.session.headers.update({
-            'Authorization': f'Bearer {api_token}',
+            'Authorization': f'Bearer {token}',
             'Content-Type': 'application/json',
-            'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
             'Pragma': 'no-cache',
             'Expires': '0'
         })
-        # Cache for API endpoints
-        self._api_endpoints = None
+        self._api_endpoints = {
+            'products': '/products',
+            'carts': '/carts',
+            'cart-products': '/cart-products',
+            'orders': '/orders'  # Это будет работать после создания коллекции в Strapi
+        }
 
-    def _discover_endpoints(self) -> Dict:
-        """Discover available API endpoints"""
-        if self._api_endpoints is not None:
-            return self._api_endpoints
-
+    def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict:
+        """Make request to Strapi API"""
         try:
-            response = self._make_request('GET', '')
-            self._api_endpoints = response.get('data', {})
-            logger.info(f"Discovered API endpoints: {json.dumps(self._api_endpoints, indent=2)}")
-            return self._api_endpoints
-        except Exception as e:
-            logger.error(f"Failed to discover API endpoints: {e}")
-            return {}
+            # Use the endpoint directly from our predefined list
+            url = f"{self.api_url}{self._api_endpoints.get(endpoint, f'/{endpoint}')}"
+            
+            # Add cache busting for GET requests
+            if method.upper() == 'GET':
+                params = kwargs.get('params', {})
+                params['_t'] = int(time.time())
+                kwargs['params'] = params
+
+            response = self.session.request(method, url, **kwargs)
+            
+            # For DELETE requests, consider both 200 and 204 as success
+            if method.upper() == 'DELETE':
+                if response.status_code in (200, 204):
+                    logger.info(f"DELETE request successful (status {response.status_code})")
+                    return {'success': True}
+                response.raise_for_status()
+            
+            # For other methods, raise for any non-2xx status
+            if not 200 <= response.status_code < 300:
+                response.raise_for_status()
+            
+            # Try to parse JSON only if there's content
+            if response.content:
+                try:
+                    return response.json()
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON response: {e}")
+                    logger.error(f"Response content: {response.text}")
+                    raise
+            else:
+                logger.info("Response has no content, returning success")
+                return {'success': True}
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {e}")
+            if hasattr(e.response, 'text'):
+                logger.error(f"Response text: {e.response.text}")
+            raise StrapiError(f"API request failed: {str(e)}")
 
     def get_products(self) -> List[Dict]:
         """Get all products with their details"""
@@ -877,63 +1048,6 @@ class StrapiClient:
         except Exception as e:
             logger.error(f"Unexpected error in add_to_cart: {e}")
             raise StrapiError(f"Failed to add item: {str(e)}")
-
-    def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict:
-        """Make request to Strapi API with enhanced caching control"""
-        # Add /api/ prefix if it's not already there and endpoint is not empty
-        if endpoint and not endpoint.startswith('api/'):
-            endpoint = f"api/{endpoint}"
-        url = f"{self.api_url}/{endpoint.lstrip('/')}"
-        
-        # Add cache-busting headers to all requests
-        headers = kwargs.pop('headers', {})
-        headers.update({
-            'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
-            'Pragma': 'no-cache',
-            'Expires': '0',
-            'If-Match': '*',
-            'If-None-Match': '*',
-            '_t': str(int(time.time() * 1000))
-        })
-        
-        # Add cache-busting parameter to GET requests
-        if method.upper() == 'GET':
-            params = kwargs.get('params', {})
-            params['_t'] = str(int(time.time() * 1000))
-            kwargs['params'] = params
-
-        try:
-            logger.info(f"Making {method} request to {url}")
-            response = self.session.request(method, url, headers=headers, **kwargs)
-            
-            # For DELETE requests, consider both 200 and 204 as success
-            if method.upper() == 'DELETE':
-                if response.status_code in (200, 204):
-                    logger.info(f"DELETE request successful (status {response.status_code})")
-                    return {'success': True}
-                response.raise_for_status()
-            
-            # For other methods, raise for any non-2xx status
-            if not 200 <= response.status_code < 300:
-                response.raise_for_status()
-            
-            # Try to parse JSON only if there's content
-            if response.content:
-                try:
-                    return response.json()
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse JSON response: {e}")
-                    logger.error(f"Response content: {response.text}")
-                    raise
-            else:
-                logger.info("Response has no content, returning success")
-                return {'success': True}
-                
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed: {e}")
-            if hasattr(e.response, 'text'):
-                logger.error(f"Response text: {e.response.text}")
-            raise StrapiError(f"API request failed: {str(e)}")
 
     def verify_removal(self, cart_id: str, item_id: str) -> bool:
         """Verify item removal with direct query using documentId"""
@@ -1038,60 +1152,211 @@ class StrapiClient:
             logger.error("Full error details:", exc_info=True)
             raise StrapiError(f"Failed to remove item: {str(e)}")
 
+    def get_client(self, tg_id):
+        """Get client by telegram ID"""
+        try:
+            # Используем _make_request вместо прямого вызова session.get
+            response = self._make_request(
+                'GET',
+                'clients',
+                params={
+                    'filters[tg_id][$eq]': tg_id,
+                    '_t': int(time.time())  # Cache busting
+                }
+            )
+            
+            if response.get('data') and len(response['data']) > 0:
+                return response['data'][0]
+            return None
+        except Exception as e:
+            logger.error(f"Error getting client: {e}")
+            raise StrapiError(f"Failed to get client: {str(e)}")
+
+    def create_client(self, tg_id, email, username=None):
+        """Create new client or update existing one"""
+        try:
+            # Check if client already exists
+            existing_client = self.get_client(tg_id)
+            if existing_client:
+                # Update existing client
+                client_id = existing_client['id']
+                response = self._make_request(
+                    'PUT',
+                    f'clients/{client_id}',
+                    json={
+                        'data': {
+                            'email': email,
+                            'username': username,
+                            'tg_id': tg_id
+                        }
+                    }
+                )
+            else:
+                # Create new client
+                response = self._make_request(
+                    'POST',
+                    'clients',
+                    json={
+                        'data': {
+                            'email': email,
+                            'username': username,
+                            'tg_id': tg_id
+                        }
+                    }
+                )
+            
+            return response['data']
+        except Exception as e:
+            logger.error(f"Error creating/updating client: {e}")
+            raise StrapiError(f"Failed to create/update client: {str(e)}")
+
+    def create_order(self, tg_id: str, email: str) -> Dict:
+        """Create a new order"""
+        try:
+            # Get cart data
+            cart = self.get_cart(tg_id)
+            if not cart:
+                raise StrapiError("Cart not found")
+
+            cart_items = cart.get('cart_products', [])
+            if not cart_items:
+                raise StrapiError("Cart is empty")
+
+            # Calculate total and prepare cart product IDs
+            total = 0
+            cart_product_ids = []
+            for item in cart_items:
+                total += item['quantity'] * item['product']['price']
+                cart_product_ids.append(item['id'])
+
+            # Prepare order data
+            order_data = {
+                'data': {
+                    'email': email,
+                    'order_status': 'new',  # Используем правильное название поля
+                    'total': total,
+                    'cart_products': {
+                        'connect': cart_product_ids
+                    }
+                }
+            }
+
+            logger.info(f"Creating order with data: {json.dumps(order_data, indent=2)}")
+
+            # Create order
+            try:
+                response = self._make_request('POST', 'orders', json=order_data)
+                if response and response.get('data'):
+                    logger.info(f"Order created successfully: {response}")
+                    # Clear cart after successful order creation
+                    self.clear_cart(tg_id)
+                    return response['data']
+            except StrapiError as e:
+                if "400" in str(e):
+                    error_msg = str(e)
+                    if "order_status" in error_msg.lower():
+                        raise StrapiError(
+                            "Could not create order. Please check that:\n"
+                            "1. The 'order_status' field in Order collection is set up as an enumeration\n"
+                            "2. The enumeration values are exactly: new, processing, completed, cancelled\n"
+                            "3. The values are case-sensitive"
+                        )
+                    elif "cart_products" in error_msg.lower():
+                        raise StrapiError(
+                            "Could not create order. Please check that:\n"
+                            "1. The 'cart_products' field in Order collection is set up as a relation to CartProduct\n"
+                            "2. The relation is configured as 'one-to-many' or 'many-to-many'\n"
+                            "3. The Public role has permissions to create relations"
+                        )
+                elif "404" in str(e):
+                    raise StrapiError(
+                        "Could not create order. Please make sure that:\n"
+                        "1. The 'Order' collection is created in Strapi\n"
+                        "2. The collection has the following fields:\n"
+                        "   - email (Text)\n"
+                        "   - order_status (Enumeration with values: new, processing, completed, cancelled)\n"
+                        "   - cart_products (Relation to CartProduct)\n"
+                        "   - total (Number)\n"
+                        "3. The Public role has permissions to create orders"
+                    )
+                raise
+
+            raise StrapiError("Failed to create order")
+
+        except Exception as e:
+            logger.error(f"Error creating order: {e}")
+            raise StrapiError(f"Failed to create order: {str(e)}")
+
+    def clear_cart(self, tg_id: str) -> bool:
+        """Clear all items from cart"""
+        try:
+            cart = self.get_cart(tg_id)
+            if not cart:
+                return True  # Cart already empty
+
+            cart_items = cart.get('cart_products', [])
+            for item in cart_items:
+                try:
+                    self._make_request('DELETE', f'cart-products/{item["id"]}')
+                except Exception as e:
+                    logger.error(f"Error removing item {item['id']}: {e}")
+                    continue
+
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing cart: {e}")
+            raise StrapiError(f"Failed to clear cart: {str(e)}")
+
 
 def main():
-    """Main function to start the bot"""
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO
+    """Start the bot"""
+    env = Env()
+    env.read_env()
+
+    # Initialize bot
+    updater = Updater(env.str('TELEGRAM_TOKEN'))
+    dispatcher = updater.dispatcher
+
+    # Initialize Strapi client
+    strapi = StrapiClient(env.str('STRAPI_URL'), env.str('STRAPI_TOKEN'))
+    dispatcher.bot_data['strapi'] = strapi
+    dispatcher.bot_data['env'] = env
+
+    # Add conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            HANDLE_MENU: [
+                CallbackQueryHandler(show_products_list, pattern='^show_products$'),
+                CallbackQueryHandler(view_cart, pattern='^view_cart$'),
+                CallbackQueryHandler(start, pattern='^main_menu$'),
+            ],
+            HANDLE_PRODUCTS: [
+                CallbackQueryHandler(add_to_cart_handler, pattern='^add_\d+$'),
+                CallbackQueryHandler(view_cart, pattern='^view_cart$'),
+                CallbackQueryHandler(start, pattern='^main_menu$'),
+            ],
+            HANDLE_CART: [
+                CallbackQueryHandler(remove_from_cart, pattern='^remove_'),
+                CallbackQueryHandler(checkout, pattern='^checkout$'),
+                CallbackQueryHandler(show_products_list, pattern='^show_products$'),
+                CallbackQueryHandler(start, pattern='^main_menu$'),
+            ],
+            WAITING_EMAIL: [
+                MessageHandler(Filters.regex(r'^[^/].*$'), handle_email),  # Match any text that doesn't start with /
+                CallbackQueryHandler(start, pattern='^main_menu$'),
+            ],
+        },
+        fallbacks=[CommandHandler('start', start)],
+        name='fish_store_conversation',
+        persistent=False
     )
 
-    try:
-        env = Env()
-        env.read_env()
+    dispatcher.add_handler(conv_handler)
 
-        # Initialize Redis connection
-        redis_conn = get_database_connection(env)
-        redis_conn.ping()
-
-        # Initialize bot
-        updater = Updater(env.str('TG_BOT_TOKEN'))
-        dispatcher = updater.dispatcher
-
-        # Store shared resources in bot_data
-        dispatcher.bot_data['env'] = env
-        dispatcher.bot_data['redis'] = redis_conn
-        dispatcher.bot_data['strapi'] = StrapiClient(env.str('STRAPI_URL'), env.str('STRAPI_TOKEN'))
-
-        # Add error handler
-        dispatcher.add_error_handler(error_handler)
-
-        # Add conversation handler
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler('start', start)],
-            states={
-                HANDLE_MENU: [CallbackQueryHandler(handle_product_selection)],
-                HANDLE_CART: [CallbackQueryHandler(handle_cart_actions)],
-                HANDLE_QUANTITY: [
-                    CallbackQueryHandler(handle_quantity_selection),
-                    MessageHandler(Filters.text & ~Filters.command, handle_custom_quantity)
-                ]
-            },
-            fallbacks=[CommandHandler('start', start)],
-        )
-
-        dispatcher.add_handler(conv_handler)
-
-        logger.info('🐟 Рыбный бот запущен успешно!')
-        updater.start_polling()
-        updater.idle()
-
-    except redis.exceptions.ConnectionError as e:
-        logger.critical(f'❌ Ошибка подключения к Redis: {e}')
-    except StrapiError as e:
-        logger.critical(f'❌ Ошибка Strapi API: {e}')
-    except Exception as e:
-        logger.critical('❌ Фатальная ошибка:', exc_info=True)
+    # Start the bot
+    updater.start_polling()
+    updater.idle()
 
 
 if __name__ == '__main__':
