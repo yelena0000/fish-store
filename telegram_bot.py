@@ -17,129 +17,129 @@ logger = logging.getLogger(__file__)
 START, HANDLE_MENU, HANDLE_PRODUCTS, HANDLE_CART, HANDLE_QUANTITY, WAITING_EMAIL = range(6)
 
 
-class StrapiError(Exception):
-    """Исключение для ошибок Strapi API."""
-    pass
+def init_strapi_session(api_url: str, token: str) -> requests.Session:
+    """Инициализирует сессию для работы с Strapi API."""
+    session = requests.Session()
+    session.headers.update({
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    })
+    return session
 
 
-class StrapiClient:
-    """Клиент для взаимодействия с API Strapi."""
-    def __init__(self, api_url: str, token: str):
-        """Инициализирует клиента Strapi."""
-        self.api_url = api_url.rstrip('/') + '/api'
-        self.token = token
-        self.session = requests.Session()
-        self.session.headers.update({
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json'
-        })
+def force_cart_refresh(session: requests.Session, api_url: str, cart_id: int) -> None:
+    """Обновляет корзину для синхронизации данных в Strapi."""
+    url = f"{api_url.rstrip('/')}/api/carts/{cart_id}"
+    response = session.put(url, json={'data': {}})
+    response.raise_for_status()
 
-    def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict:
-        """Выполняет HTTP-запрос к API Strapi."""
-        url = f'{self.api_url}/{endpoint}'
-        response = self.session.request(method, url, **kwargs)
+
+def get_products(session: requests.Session, api_url: str) -> List[Dict]:
+    """Возвращает список всех товаров из Strapi."""
+    url = f"{api_url.rstrip('/')}/api/products?populate=*"
+    response = session.get(url)
+    response.raise_for_status()
+    return response.json().get('data', [])
+
+
+def get_cart(session: requests.Session, api_url: str, tg_id: str) -> Optional[Dict]:
+    """Возвращает корзину пользователя по его Telegram ID."""
+    url = f"{api_url.rstrip('/')}/api/carts"
+    params = {
+        'filters[tg_id][$eq]': tg_id,
+        'populate[cart_products][populate][product]': 'true'
+    }
+    response = session.get(url, params=params)
+    response.raise_for_status()
+    carts = response.json().get('data', [])
+    return carts[0] if carts else None
+
+
+def create_cart(session: requests.Session, api_url: str, tg_id: str) -> Dict:
+    """Создает новую корзину для пользователя."""
+    url = f"{api_url.rstrip('/')}/api/carts"
+    cart_payload = {'data': {'tg_id': tg_id}}
+    response = session.post(url, json=cart_payload)
+    response.raise_for_status()
+    return response.json()['data']
+
+
+def add_item_to_cart(session: requests.Session, api_url: str, cart_id: int, product_id: int, quantity: float) -> Dict:
+    """Добавляет товар в корзину в Strapi."""
+    url = f"{api_url.rstrip('/')}/api/cart-products"
+    cart_item = {
+        'data': {
+            'quantity': quantity,
+            'product': product_id,
+            'cart': cart_id
+        }
+    }
+    response = session.post(url, json=cart_item)
+    response.raise_for_status()
+    return response.json()['data']
+
+
+def remove_from_cart(session: requests.Session, api_url: str, document_id: str, tg_id: str) -> bool:
+    """Удаляет товар из корзины по documentId."""
+    url = f"{api_url.rstrip('/')}/api/cart-products/{document_id}"
+    try:
+        response = session.delete(url)
         response.raise_for_status()
-        return response.json() if response.content else {}
-
-    def force_cart_refresh(self, cart_id: int) -> None:
-        """Обновляет корзину для синхронизации данных в Strapi."""
-        # Обновляем tg_id на то же значение, чтобы Strapi обновил запись
-        self._make_request('PUT', f'carts/{cart_id}', json={'data': {}})
-
-    def get_products(self) -> List[Dict]:
-        """Возвращает список всех товаров из Strapi."""
-        return self._make_request('GET', 'products?populate=*').get('data', [])
-
-    def get_cart(self, tg_id: str) -> Optional[Dict]:
-        """Возвращает корзину пользователя по его Telegram ID."""
-        params = {
-            'filters[tg_id][$eq]': tg_id,
-            'populate[cart_products][populate][product]': 'true'
-        }
-        carts = self._make_request('GET', 'carts', params=params).get('data', [])
-        return carts[0] if carts else None
-
-    def create_cart(self, tg_id: str) -> Dict:
-        """Создает новую корзину для пользователя."""
-        data = {'data': {'tg_id': tg_id}}
-        return self._make_request('POST', 'carts', json=data)['data']
-
-    def add_to_cart(self, cart_id: int, product_id: int, quantity: float) -> Dict:
-        """Добавляет товар в корзину в Strapi."""
-        data = {
-            'data': {
-                'quantity': quantity,
-                'product': product_id,
-                'cart': cart_id
-            }
-        }
-        return self._make_request('POST', 'cart-products', json=data)['data']
-
-    def remove_from_cart(self, document_id: str, tg_id: str) -> bool:
-        """Удаляет товар из корзины по documentId."""
-        try:
-            self._make_request('DELETE', f'cart-products/{document_id}')
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                return False
-            else:
-                raise
-            
-        cart_after = self.get_cart(tg_id)
-        if cart_after:
-            try:
-                self.force_cart_refresh(cart_after['id'])
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 404:
-                    pass
-                else:
-                    raise
-        return True
-
-    def create_order(self, tg_id: str, email: str) -> bool:
-        """Создает заказ для пользователя."""
-        cart = self.get_cart(tg_id)
-        if not cart or not cart.get('cart_products'):
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
             return False
+        raise
 
-        total = sum(
-            item['quantity'] * item['product']['price']
-            for item in cart['cart_products']
-        )
+    cart_after = get_cart(session, api_url, tg_id)
+    if cart_after and cart_after.get('cart_products'):
+        force_cart_refresh(session, api_url, cart_after['id'])
+    return True
 
-        order_data = {
-            'data': {
-                'email': email,
-                'order_status': 'new',
-                'total': total,
-                'cart_products': [item['id'] for item in cart['cart_products']]
-            }
+
+def create_order(session: requests.Session, api_url: str, tg_id: str, email: str) -> bool:
+    """Создает заказ для пользователя."""
+    cart = get_cart(session, api_url, tg_id)
+    if not cart or not cart.get('cart_products'):
+        return False
+
+    total = sum(
+        item['quantity'] * item['product']['price']
+        for item in cart['cart_products']
+    )
+
+    url = f"{api_url.rstrip('/')}/api/orders"
+    order_details = {
+        'data': {
+            'email': email,
+            'order_status': 'new',
+            'total': total,
+            'cart_products': [item['id'] for item in cart['cart_products']]
         }
-
-        self._make_request('POST', 'orders', json=order_data)
-        return True
+    }
+    response = session.post(url, json=order_details)
+    response.raise_for_status()
+    return True
 
 
 def start(update: Update, context) -> int:
     """Показывает главное меню и приветствие."""
-    # Удаляем последнее фото, если оно есть
     last_photo_id = context.user_data.pop('last_photo_message_id', None)
     if last_photo_id:
-        try:
-            chat_id = update.effective_chat.id
-            context.bot.delete_message(
-                chat_id=chat_id,
-                message_id=last_photo_id
-            )
-        except Exception:
-            pass
+        context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=last_photo_id
+        )
 
-    products = context.bot_data['strapi'].get_products()
+    session = context.bot_data['strapi_session']
+    api_url = context.bot_data['api_url']
+    products = get_products(session, api_url)
     context.user_data['products'] = products
 
     keyboard = []
     if products:
-        keyboard.append([InlineKeyboardButton('🎣 Посмотреть рыбу', callback_data='show_products')])
+        keyboard.append([
+            InlineKeyboardButton('🎣 Посмотреть рыбу', callback_data='show_products')
+        ])
 
     keyboard.extend([
         [InlineKeyboardButton('🛒 Моя корзина', callback_data='view_cart')],
@@ -147,15 +147,16 @@ def start(update: Update, context) -> int:
     ])
 
     text = (
-        '🐟 <b>Добро пожаловать в наш магазин рыбы!</b>\n\n'
-        'Здесь вы можете выбрать свежую рыбу высочайшего качества.\n'
-        'Все товары продаются на вес в килограммах.'
+        "🐟 <b>Добро пожаловать в наш магазин рыбы!</b>\n\n"
+        "Здесь вы можете выбрать свежую рыбу высочайшего качества.\n"
+        "Все товары продаются на вес в килограммах."
     )
 
     if update.message:
         update.message.reply_text(text, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        safe_edit_message(update.callback_query, context, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+        safe_edit_message(update.callback_query, context, text, reply_markup=InlineKeyboardMarkup(keyboard),
+                          parse_mode='HTML')
 
     return HANDLE_MENU
 
@@ -212,19 +213,16 @@ def show_products_list(update: Update, context) -> int:
     query = update.callback_query
     query.answer()
 
-    # Удаляем последнее фото, если оно есть
     last_photo_id = context.user_data.pop('last_photo_message_id', None)
     if last_photo_id:
-        try:
-            context.bot.delete_message(
-                chat_id=query.message.chat_id,
-                message_id=last_photo_id
-            )
-        except Exception:
-            pass
+        context.bot.delete_message(
+            chat_id=query.message.chat_id,
+            message_id=last_photo_id
+        )
 
-    # Всегда обновляем список товаров из Strapi
-    products = context.bot_data['strapi'].get_products()
+    session = context.bot_data['strapi_session']
+    api_url = context.bot_data['api_url']
+    products = get_products(session, api_url)
     context.user_data['products'] = products
 
     if not products:
@@ -255,48 +253,38 @@ def show_products_list(update: Update, context) -> int:
 
 def send_product_photo(query, context, product, caption, reply_markup):
     """Отправляет фото товара с описанием, удаляет старое сообщение с фото."""
-    try:
-        # Удаляем старое сообщение, если оно есть
-        try:
-            context.bot.delete_message(
-                chat_id=query.message.chat_id,
-                message_id=query.message.message_id
-            )
-        except Exception:
-            pass
-        base_url = context.bot_data['env'].str('STRAPI_URL').rstrip('/')
-        image = product.get('image')
-        image_path = None
-        if image:
-            image_path = image.get('formats', {}).get('small', {}).get('url') or image.get('url')
-        if not image_path:
-            raise ValueError('Нет изображения для товара')
-        if image_path.startswith('http'):
-            image_url = image_path
-        else:
-            image_url = f"{base_url}{image_path}" if image_path.startswith('/') else f"{base_url}/{image_path}"
-        response = requests.get(image_url, stream=True, timeout=10)
-        response.raise_for_status()
-        content_type = response.headers.get('content-type', '')
-        if not content_type.startswith('image/'):
-            raise ValueError("File is not an image")
-        with BytesIO(response.content) as photo_data:
-            photo_data.seek(0)
-            msg = context.bot.send_photo(
-                chat_id=query.message.chat_id,
-                photo=photo_data,
-                caption=caption,
-                parse_mode='HTML',
-                reply_markup=reply_markup
-            )
-            context.user_data['last_photo_message_id'] = msg.message_id
-    except Exception:
+    context.bot.delete_message(
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id
+    )
+    base_url = context.bot_data['env'].str('STRAPI_URL').rstrip('/')
+    image = product.get('image')
+    image_path = image.get('formats', {}).get('small', {}).get('url') or image.get('url') if image else None
+    if not image_path:
         context.bot.send_message(
             chat_id=query.message.chat_id,
             text=caption,
             parse_mode='HTML',
             reply_markup=reply_markup
         )
+        return
+
+    image_url = image_path if image_path.startswith('http') else f"{base_url}/{image_path.lstrip('/')}"
+    response = requests.get(image_url, stream=True, timeout=10)
+    response.raise_for_status()
+    if not response.headers.get('content-type', '').startswith('image/'):
+        raise ValueError("File is not an image")
+
+    with BytesIO(response.content) as photo_data:
+        photo_data.seek(0)
+        msg = context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=photo_data,
+            caption=caption,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+        context.user_data['last_photo_message_id'] = msg.message_id
 
 
 def show_product_details(update: Update, context) -> int:
@@ -313,7 +301,8 @@ def show_product_details(update: Update, context) -> int:
             '❌ Товар не найден',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton('🎣 К списку рыбы', callback_data='show_products')]
-            ])
+            ]),
+            parse_mode='HTML'
         )
         return HANDLE_MENU
 
@@ -323,19 +312,12 @@ def show_product_details(update: Update, context) -> int:
         f"💵 <b>Цена: {product['price']} руб./кг</b>"
     )
     keyboard = [
-        [InlineKeyboardButton('➕ Добавить в корзину', callback_data=f'add_{product["id"]}')],
+        [InlineKeyboardButton('➕ Добавить в корзину', callback_data=f'add_{product_id}')],
         [InlineKeyboardButton('🛒 Моя корзина', callback_data='view_cart')],
-        [InlineKeyboardButton('⬅️ К списку рыбы', callback_data='show_products')],
+        [InlineKeyboardButton('⬅ К списку рыбы', callback_data='show_products')],
         [InlineKeyboardButton('🏠 В главное меню', callback_data='main_menu')]
     ]
-    try:
-        context.bot.delete_message(
-            chat_id=query.message.chat_id,
-            message_id=query.message.message_id
-        )
-    except Exception:
-        pass
-    send_product_photo(query, context, product, caption, InlineKeyboardMarkup(keyboard))
+    send_product_photo(query, context, product, caption, reply_markup=InlineKeyboardMarkup(keyboard))
     return HANDLE_PRODUCTS
 
 
@@ -350,19 +332,23 @@ def ask_quantity(update: Update, context, product_id: str) -> int:
         return show_products_list(update, context)
 
     context.user_data['current_product'] = product_id
-    text = f"📦 <b>Выберите количество:</b>\n🐟 {product['title']}"
+    text = (
+        f"📦 <b>Выберите количество:</b>\n"
+        f"🐟 {product['title']}"
+    )
 
     keyboard = [
         [InlineKeyboardButton("0.5 кг", callback_data=f"qty_0.5_{product_id}")],
         [InlineKeyboardButton("1 кг", callback_data=f"qty_1.0_{product_id}")],
         [InlineKeyboardButton("1.5 кг", callback_data=f"qty_1.5_{product_id}")],
         [InlineKeyboardButton("2 кг", callback_data=f"qty_2.0_{product_id}")],
-        [InlineKeyboardButton("✏️ Ввести свое количество", callback_data="custom_qty")],
+        [InlineKeyboardButton("✏️ Ввести", callback_data="custom_qty")],
         [InlineKeyboardButton("⬅️ Назад к товару", callback_data=f"product_{product_id}")]
     ]
 
     safe_edit_message(
-        query, context,
+        query,
+        context,
         text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='HTML'
@@ -398,9 +384,11 @@ def handle_quantity_selection(update: Update, context) -> int:
 
     if query.data == 'custom_qty':
         query.edit_message_text(
-            "✏️ <b>Введите количество в килограммах</b>\n\n"
-            "Например: 1.5 или 2.3\n"
-            "Минимальное количество: 0.1 кг",
+            text=(
+                "✏️ <b>Введите количество в килограммах</b>\n\n"
+                "Например: 1.5 или 2.3\n"
+                "Минимальное количество: 0.1 кг"
+            ),
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ Отмена", callback_data="cancel_qty")]
@@ -449,12 +437,16 @@ def handle_custom_quantity(update: Update, context) -> int:
 
 def add_to_cart(update: Update, context, product_id: str, quantity: float) -> int:
     """Добавляет товар в корзину пользователя."""
-    strapi = context.bot_data['strapi']
+    session = context.bot_data['strapi_session']
+    api_url = context.bot_data['api_url']
     query = getattr(update, 'callback_query', None)
     if query is not None:
         tg_id = str(query.from_user.id)
         chat_id = query.message.chat_id
     else:
+        if not hasattr(update.message, 'from_user') or not hasattr(update.message, 'chat_id'):
+            update.message.reply_text("Ошибка: Не удалось определить пользователя")
+            return HANDLE_MENU
         tg_id = str(update.message.from_user.id)
         chat_id = update.message.chat_id
 
@@ -468,14 +460,14 @@ def add_to_cart(update: Update, context, product_id: str, quantity: float) -> in
             update.message.reply_text(error_text)
         return show_products_list(update, context)
 
-    cart = strapi.get_cart(tg_id) or strapi.create_cart(tg_id)
-    strapi.add_to_cart(cart['id'], int(product_id), quantity)
+    cart = get_cart(session, api_url, tg_id) or create_cart(session, api_url, tg_id)
+    add_item_to_cart(session, api_url, cart['id'], int(product_id), quantity)
 
     success_text = (
         f"✅ <b>Добавлено в корзину:</b>\n"
         f"🐟 {product['title']}\n"
-        f"📦 Количество: {quantity} кг\n"
-        f"💰 Стоимость: {quantity * product['price']} руб."
+        f"📦 {quantity} кг\n"
+        f"💰 {quantity * product['price']} руб."
     )
 
     keyboard = [
@@ -507,17 +499,14 @@ def view_cart(update: Update, context) -> int:
     """Показывает содержимое корзины пользователя."""
     query = update.callback_query
     query.answer()
-    # Удаляем старое сообщение, если оно есть
-    try:
-        context.bot.delete_message(
-            chat_id=query.message.chat_id,
-            message_id=query.message.message_id
-        )
-    except Exception:
-        pass
+    context.bot.delete_message(
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id
+    )
     tg_id = str(query.from_user.id)
-    strapi = context.bot_data['strapi']
-    cart = strapi.get_cart(tg_id)
+    session = context.bot_data['strapi_session']
+    api_url = context.bot_data['api_url']
+    cart = get_cart(session, api_url, tg_id)
 
     if not cart or not cart.get('cart_products'):
         safe_edit_message(
@@ -534,7 +523,7 @@ def view_cart(update: Update, context) -> int:
     grouped_items = {}
     for item in cart['cart_products']:
         product = item['product']
-        product_id = product.get('id')
+        product_id = str(product.get('id'))
         if product_id not in grouped_items:
             grouped_items[product_id] = {
                 'product': product,
@@ -557,17 +546,18 @@ def view_cart(update: Update, context) -> int:
             f"🐟 <b>{product['title']}</b>\n"
             f"📦 {group['total_quantity']} кг × {product['price']} руб. = {group['total_price']} руб.\n\n"
         )
-        # Для удаления используем documentId первого cart_item из группы
         first_cart_item = group['cart_items'][0]
-        keyboard.append([InlineKeyboardButton(
-            f"❌ Удалить {product['title']}",
-            callback_data=f'remove_{first_cart_item["documentId"]}'
-        )])
+        keyboard.append([
+            InlineKeyboardButton(
+                f"❌ Удалить {product['title']}",
+                callback_data=f'remove_{first_cart_item["documentId"]}'
+            )
+        ])
 
     message += f"💵 <b>Итого: {total} руб.</b>"
 
     keyboard.extend([
-        [InlineKeyboardButton('📞 Оформить заказ', callback_data='checkout')],
+        [InlineKeyboardButton('📩 Оформить заказ', callback_data='checkout')],
         [InlineKeyboardButton('🎣 Продолжить покупки', callback_data='show_products')],
         [InlineKeyboardButton('🏠 В главное меню', callback_data='main_menu')]
     ])
@@ -582,17 +572,13 @@ def view_cart(update: Update, context) -> int:
 
 
 def handle_cart_actions(update: Update, context) -> int:
-    """Обрабатывает действия пользователя с корзиной (удаление, оформление заказа и т.д.)."""
+    """Обрабатывает действия пользователя с корзиной."""
     query = update.callback_query
     query.answer()
-    # Удаляем старое сообщение, если оно есть
-    try:
-        context.bot.delete_message(
-            chat_id=query.message.chat_id,
-            message_id=query.message.message_id
-        )
-    except Exception:
-        pass
+    context.bot.delete_message(
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id
+    )
     if query.data == 'main_menu':
         return start(update, context)
     elif query.data == 'show_products':
@@ -601,9 +587,10 @@ def handle_cart_actions(update: Update, context) -> int:
         return handle_checkout(update, context)
     elif query.data.startswith('remove_'):
         item_id = query.data.split('_')[1]
-        strapi = context.bot_data['strapi']
+        session = context.bot_data['strapi_session']
+        api_url = context.bot_data['api_url']
         tg_id = str(query.from_user.id)
-        removed = strapi.remove_from_cart(item_id, tg_id)
+        removed = remove_from_cart(session, api_url, item_id, tg_id)
         if not removed:
             query.answer('❌ Не удалось удалить товар')
             return HANDLE_CART
@@ -617,9 +604,11 @@ def handle_checkout(update: Update, context) -> int:
     query.answer()
 
     safe_edit_message(
-        query, context,
+        query,
+        context,
         'Для оформления заказа введите ваш email:',
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Отмена', callback_data='main_menu')]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Отмена', callback_data='main_menu')]]),
+        parse_mode='HTML'
     )
     return WAITING_EMAIL
 
@@ -628,31 +617,27 @@ def handle_email(update: Update, context) -> int:
     """Обрабатывает ввод email и создает заказ."""
     email = update.message.text.strip()
 
-    if not re.match(r'[^@]+@[^@]+\.[^@]+', email):
+    if not re.match(r'[\w\.-]+@[\w\.-]+\.\w+', email):
         update.message.reply_text('⚠️ Введите корректный email')
         return WAITING_EMAIL
 
     tg_id = str(update.message.from_user.id)
-    strapi = context.bot_data['strapi']
+    session = context.bot_data['strapi_session']
+    api_url = context.bot_data['api_url']
 
-    if strapi.create_order(tg_id, email):
-        update.message.reply_text('✅ Заказ оформлен! Мы свяжемся с вами.')
+    if create_order(session, api_url, tg_id, email):
+        update.message.reply_text('✅ Заказ успешно оформлен!')
     else:
         update.message.reply_text('⚠️ Не удалось оформить заказ. Попробуйте позже.')
 
     return start(update, context)
 
 
-def error_handler(update: Update, context):
-    """Обрабатывает все ошибки, возникающие в боте."""
+def error_handler(update: Update, context) -> None:
+    """Обрабатывает ошибки, возникающие в боте."""
     error = context.error
-
-    if isinstance(error, StrapiError):
-        logger.error('Ошибка Strapi: %s', str(error))
-        text = '⚠️ Ошибка соединения с сервером. Попробуйте позже.'
-    else:
-        logger.exception('Непредвиденная ошибка')
-        text = '⚠️ Произошла непредвиденная ошибка. Мы уже работаем над исправлением.'
+    logger.error('Ошибка в боте: %s', str(error))
+    text = '⚠️ Произошла ошибка. Попробуйте позже.'
 
     if update and update.effective_chat:
         context.bot.send_message(
@@ -664,55 +649,56 @@ def error_handler(update: Update, context):
 
 
 def main():
-    """Точка входа: запускает бота и настраивает логирование."""
+    """Запускает бота и настраивает логирование."""
+    logging.basicConfig(level=logging.INFO)
+    logger.setLevel(logging.DEBUG)
+
     env = Env()
     env.read_env()
 
-    logging.basicConfig(level=logging.ERROR)
-    logger.setLevel(logging.DEBUG)
+    updater = Updater(token=env.str('TELEGRAM_TOKEN'))
+    dispatcher = updater.dispatcher
 
-    try:
-        updater = Updater(env.str('TELEGRAM_TOKEN'))
-        dispatcher = updater.dispatcher
+    api_url = env.str('STRAPI_URL')
+    strapi_session = init_strapi_session(api_url=api_url, token=env.str('STRAPI_TOKEN'))
+    dispatcher.bot_data['strapi_session'] = strapi_session
+    dispatcher.bot_data['api_url'] = api_url
+    dispatcher.bot_data['env'] = env
 
-        strapi = StrapiClient(env.str('STRAPI_URL'), env.str('STRAPI_TOKEN'))
-        dispatcher.bot_data['strapi'] = strapi
-        dispatcher.bot_data['env'] = env
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('start', start),
+        ],
+        states={
+            HANDLE_MENU: [
+                CallbackQueryHandler(handle_product_selection),
+            ],
+            HANDLE_PRODUCTS: [
+                CallbackQueryHandler(handle_product_selection),
+            ],
+            HANDLE_QUANTITY: [
+                CallbackQueryHandler(handle_quantity_selection),
+                MessageHandler(Filters.text & ~Filters.command, handle_custom_quantity),
+            ],
+            HANDLE_CART: [
+                CallbackQueryHandler(handle_cart_actions),
+            ],
+            WAITING_EMAIL: [
+                MessageHandler(Filters.text & ~Filters.command, handle_email),
+                CallbackQueryHandler(start, pattern='^main_menu$'),
+            ],
+        },
+        fallbacks=[
+            CommandHandler('start', start),
+        ],
+        per_message=False
+    )
 
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler('start', start)],
-            states={
-                HANDLE_MENU: [
-                    CallbackQueryHandler(handle_product_selection),
-                ],
-                HANDLE_PRODUCTS: [
-                    CallbackQueryHandler(handle_product_selection),
-                ],
-                HANDLE_QUANTITY: [
-                    CallbackQueryHandler(handle_quantity_selection),
-                    MessageHandler(Filters.text & ~Filters.command, handle_custom_quantity),
-                ],
-                HANDLE_CART: [
-                    CallbackQueryHandler(handle_cart_actions),
-                ],
-                WAITING_EMAIL: [
-                    MessageHandler(Filters.text & ~Filters.command, handle_email),
-                    CallbackQueryHandler(start, pattern='^main_menu$'),
-                ],
-            },
-            fallbacks=[CommandHandler('start', start)],
-            per_message=False
-        )
+    dispatcher.add_handler(conv_handler)
+    dispatcher.add_error_handler(error_handler)
 
-        dispatcher.add_handler(conv_handler)
-        dispatcher.add_error_handler(error_handler)
-
-        updater.start_polling()
-        updater.idle()
-
-    except Exception:
-        logger.exception('Ошибка при запуске бота')
-        raise
+    updater.start_polling()
+    updater.idle()
 
 
 if __name__ == '__main__':
